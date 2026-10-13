@@ -1,0 +1,242 @@
+# 1. Install library yang dibutuhkan
+!pip install beautifulsoup4 requests pandas matplotlib scikit-learn gensim umap-learn openpyxl seaborn
+
+import requests
+from bs4 import BeautifulSoup
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import re
+from gensim.models import Word2Vec
+import umap.umap_ as umap
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+from IPython.display import HTML, display
+
+# ==========================================
+# 2. SCRAPING DATA PROVINSI & URL WIKIPEDIA
+# ==========================================
+print("--- SCRAPING DATA PROVINSI & URL WIKIPEDIA ---")
+url = "https://en.wikipedia.org/wiki/Provinces_of_Indonesia"
+headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+
+response = requests.get(url, headers=headers)
+soup = BeautifulSoup(response.content, 'html.parser')
+tables = soup.find_all('table', class_='wikitable')
+
+target_table = None
+for table in tables:
+    if "Banda Aceh" in table.text or "Aceh" in table.text:
+        target_table = table
+        break
+
+data_list = []
+rows = target_table.find_all('tr')
+
+for row in rows:
+    cols = row.find_all('td')
+    if not cols:
+        continue
+
+    row_text = [re.sub(r'\[.*?\]', '', c.text).strip() for c in cols]
+
+    if len(row_text) >= 7 and row_text[0].isdigit():
+        iso_code = row_text[0]
+        abbr = row_text[1]
+
+        # Mengambil link URL Wikipedia tiap provinsi
+        wiki_url = ""
+        for cell in cols:
+            link = cell.find('a', href=True)
+            if link and link['href'].startswith('/wiki/') and not link['href'].startswith('/wiki/ISO') and not link['href'].startswith('/wiki/File:'):
+                wiki_url = "https://en.wikipedia.org" + link['href']
+                break
+
+        text_parts = [t for t in row_text if not re.match(r'^\d[\d,\s\.]*$', t)]
+        province_eng = text_parts[1] if len(text_parts) > 1 else ""
+        province_ind = text_parts[2] if len(text_parts) > 2 else ""
+        capital = text_parts[3] if len(text_parts) > 3 else ""
+
+        data_list.append([iso_code, abbr, province_eng, province_ind, capital, wiki_url])
+
+# Membuat DataFrame data
+df = pd.DataFrame(data_list, columns=['Code', 'Abbreviation', 'Province', 'Indonesian_Name', 'Capital', 'Wikipedia_URL'])
+df.insert(0, 'No', range(1, len(df) + 1))
+
+# Teks gabungan untuk representasi fitur
+df['text_combined'] = (
+    df['Province'].fillna('') + ' ' +
+    df['Indonesian_Name'].fillna('') + ' ' +
+    df['Capital'].fillna('')
+).str.strip()
+
+# ==========================================
+# 3. FEATURE ENGINEERING (WORD2VEC & MEAN POOLING)
+# ==========================================
+print("\n--- MENJALANKAN FEATURE ENGINEERING (WORD2VEC) ---")
+sentences = [doc.split() for doc in df['text_combined'] if len(doc.split()) > 0]
+
+w2v_model = Word2Vec(
+    sentences=sentences,
+    vector_size=100,
+    window=5,
+    min_count=1,
+    workers=4,
+    sg=1
+)
+
+def get_document_vector(tokens, model):
+    valid_vectors = [model.wv[word] for word in tokens if word in model.wv]
+    if not valid_vectors:
+        return np.zeros(model.vector_size)
+    return np.mean(valid_vectors, axis=0)
+
+X_features = np.array([get_document_vector(doc.split(), w2v_model) for doc in df['text_combined']])
+
+df_features = pd.DataFrame(X_features)
+df_features.insert(0, 'Wikipedia_URL', df['Wikipedia_URL'])
+df_features.insert(0, 'Capital', df['Capital'])
+df_features.insert(0, 'Province', df['Province'])
+df_features.insert(0, 'No', df['No'])
+
+print("\n--- HASIL TABEL FEATURE ENGINEERING (WORD2VEC) ---")
+display(df_features.head(10))
+
+# ==========================================
+# 4. TEXT SIMILARITY (TF-IDF & COSINE SIMILARITY)
+# ==========================================
+print("\n--- PROSES TEXT SIMILARITY (TF-IDF) ---")
+corpus = df['text_combined'].tolist()
+
+vectorizer = TfidfVectorizer()
+documents_tfidf_features = vectorizer.fit_transform(corpus)
+
+# A. Matriks Kemiripan Seluruh Provinsi (Full Pairwise Cosine Similarity Matrix)
+full_similarity_matrix = cosine_similarity(documents_tfidf_features)
+df_similarity_matrix = pd.DataFrame(
+    full_similarity_matrix,
+    index=df['Province'],
+    columns=df['Province']
+)
+
+print("\n--- SIMILARITY MATRIX ANTAR PROVINSI (10 BARIS & KOLOM PERTAMA) ---")
+display(df_similarity_matrix.iloc[:10, :10])
+
+# B. Similarity Pencarian Berdasarkan Query (Top-K)
+TopK = 10
+query = "Capital of West Java Bandung"
+
+query_tfidf_features = vectorizer.transform([query])
+print("TF-IDF features for query:\n", query_tfidf_features, "\n")
+
+similarities = cosine_similarity(documents_tfidf_features, query_tfidf_features)
+top_indices = similarities[:, 0].argsort()[::-1][:TopK]
+
+provinces = []
+capitals = []
+urls = []
+urls_raw = []
+
+for doc_index in top_indices:
+    provinces.append(df.iloc[doc_index].Province)
+    capitals.append(df.iloc[doc_index].Capital)
+    raw_url = df.iloc[doc_index].Wikipedia_URL
+    urls_raw.append(raw_url)
+    wiki_link = f'<a href="{raw_url}" target="_blank">{raw_url}</a>'
+    urls.append(wiki_link)
+
+results = pd.DataFrame({
+    "Province": provinces,
+    "Capital": capitals,
+    "Wikipedia_URL": urls,
+    "Similarities": similarities[top_indices, 0]
+})
+
+results_export = pd.DataFrame({
+    "Province": provinces,
+    "Capital": capitals,
+    "Wikipedia_URL": urls_raw,
+    "Similarities": similarities[top_indices, 0]
+})
+
+print("\n--- HASIL TEXT SIMILARITY (TOP K) ---")
+display(HTML(results.to_html(escape=False)))
+
+# ==========================================
+# 5. VISUALISASI GRAFIK (BAR CHART, HEATMAP & UMAP)
+# ==========================================
+print("\n--- MEMBUAT VISUALISASI GRAFIK ---")
+
+# Grafik 1: Bar Chart Top-K Similarity
+plt.figure(figsize=(10, 6))
+plt.barh(results['Province'][::-1], results['Similarities'][::-1], color='teal')
+plt.xlabel('Cosine Similarity Score')
+plt.title(f'Top {TopK} Most Similar Provinces for Query: "{query}"')
+plt.grid(axis='x', linestyle='--', alpha=0.7)
+plt.tight_layout()
+plt.savefig("TopK_Text_Similarity.png", dpi=300)
+plt.show()
+
+# Grafik 2: Heatmap Similarity Matrix (Sampel 15 Provinsi Pertama agar Jelas)
+plt.figure(figsize=(12, 10))
+sample_matrix = df_similarity_matrix.iloc[:15, :15]
+sns.heatmap(sample_matrix, annot=True, cmap='YlGnBu', fmt=".2f", linewidths=0.5)
+plt.title('Heatmap Cosine Similarity Antar Provinsi (Top 15 Sample)', fontsize=14)
+plt.xticks(rotation=45, ha='right')
+plt.yticks(rotation=0)
+plt.tight_layout()
+plt.savefig("Similarity_Heatmap.png", dpi=300)
+plt.show()
+
+# Grafik 3: UMAP Feature Visualization (Word Embedding)
+words = list(w2v_model.wv.index_to_key)
+word_vectors = np.array([w2v_model.wv[w] for w in words])
+
+reducer = umap.UMAP(n_neighbors=5, min_dist=0.1, random_state=42)
+embedding_2d = reducer.fit_transform(word_vectors)
+
+df_umap = pd.DataFrame({
+    'umap1': embedding_2d[:, 0],
+    'umap2': embedding_2d[:, 1],
+    'word': words
+})
+
+plt.figure(figsize=(12, 8))
+plt.scatter(df_umap['umap1'], df_umap['umap2'], alpha=0.7, color='steelblue')
+
+for i, word in enumerate(words):
+    plt.annotate(word, xy=(df_umap['umap1'][i], df_umap['umap2'][i]), fontsize=9)
+
+plt.title('UMAP Feature Visualization (Word Embedding)', fontsize=14)
+plt.xlabel('umap1')
+plt.ylabel('umap2')
+plt.grid(True, linestyle='--', alpha=0.5)
+
+plt.savefig("UMAP_Feature_Visualization.png", dpi=300, bbox_inches='tight')
+plt.show()
+
+# ==========================================
+# 6. EXPORT HASIL (CSV & XLSX)
+# ==========================================
+# Export CSV
+df_features.to_csv("Data_Provinsi_Features.csv", index=False)
+results_export.to_csv("Text_Similarity_Results.csv", index=False)
+df_similarity_matrix.to_csv("Data_Provinsi_Similarity_Matrix.csv")
+
+# Export Excel dengan multiple sheets
+excel_filename = "Data_Provinsi_Analysis.xlsx"
+with pd.ExcelWriter(excel_filename, engine='openpyxl') as writer:
+    df.to_excel(writer, sheet_name='Scraped_Data', index=False)
+    df_features.to_excel(writer, sheet_name='W2V_Features', index=False)
+    results_export.to_excel(writer, sheet_name='Text_Similarity_TopK', index=False)
+    df_similarity_matrix.to_excel(writer, sheet_name='Full_Similarity_Matrix')
+
+print(f"\nProses Selesai! File telah tersimpan di direktori/sidebar Google Colab:")
+print("- Data_Provinsi_Features.csv")
+print("- Text_Similarity_Results.csv")
+print("- Data_Provinsi_Similarity_Matrix.csv")
+print(f"- {excel_filename} (Berisi 4 Sheet)")
+print("- TopK_Text_Similarity.png")
+print("- Similarity_Heatmap.png")
+print("- UMAP_Feature_Visualization.png")
