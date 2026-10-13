@@ -1,0 +1,1 @@
+# Teks-Similarity-Nadiya-Chintiya-Dewi-25031554231
